@@ -31,6 +31,11 @@ func Template() *template.Template {
 	return template.New("").Funcs(funcs)
 }
 
+// Templater provides a functionalit to set a Template into the caller.
+type Templater interface {
+	SetTemplate(*template.Template)
+}
+
 // Render renders the doc to the given writer using the provided template.
 func (d *Doc) Render(w io.Writer, t *template.Template) error {
 	data := struct {
@@ -42,17 +47,8 @@ func (d *Doc) Render(w io.Writer, t *template.Template) error {
 	return t.ExecuteTemplate(w, "root", data)
 }
 
-// Render renders the section to the given writer using the provided template.
-func (s *Section) Render(w io.Writer, t *template.Template) error {
-	data := struct {
-		*Section
-		Template    *template.Template
-		PlayEnabled bool
-	}{s, t, PlayEnabled}
-	return t.ExecuteTemplate(w, "section", data)
-}
-
 type ParseFunc func(ctx *Context, fileName string, lineNumber int, inputLine string) (Elem, error)
+type Renderer func(w io.Writer, t *template.Template) error
 
 // Register binds the named action, which does not begin with a period, to the
 // specified parser to be invoked when the name, with a period, appears in the
@@ -102,6 +98,9 @@ type Section struct {
 	Notes   []string
 	Classes []string
 	Styles  []string
+
+	Template    *template.Template
+	PlayEnabled bool
 }
 
 // HTMLAttributes for the section
@@ -119,6 +118,12 @@ func (s Section) HTMLAttributes() template.HTMLAttr {
 		style = fmt.Sprintf(`style=%q`, strings.Join(s.Styles, " "))
 	}
 	return template.HTMLAttr(strings.Join([]string{class, style}, " "))
+}
+
+// SetTemplate implements Templater interface
+func (s *Section) SetTemplate(t *template.Template) {
+	s.Template = t
+	s.PlayEnabled = PlayEnabled
 }
 
 // Sections contained within the section.
@@ -149,6 +154,19 @@ func (s Section) FormattedNumber() string {
 
 func (s Section) TemplateName() string { return "section" }
 
+type Elems struct {
+	Children []Elem
+	Template *template.Template
+}
+
+// SetTemplate implements Templater interface
+func (els *Elems) SetTemplate(t *template.Template) {
+	els.Template = t
+}
+
+// TemmplateName implements Elem interface
+func (els Elems) TemplateName() string { return "elements" }
+
 // Elem defines the interface for a present element. That is, something that
 // can provide the name of the template used to render the element.
 type Elem interface {
@@ -158,14 +176,10 @@ type Elem interface {
 // renderElem implements the elem template function, used to render
 // sub-templates.
 func renderElem(t *template.Template, e Elem) (template.HTML, error) {
-	var data interface{} = e
-	if s, ok := e.(Section); ok {
-		data = struct {
-			Section
-			Template *template.Template
-		}{s, t}
+	if tl, ok := e.(Templater); ok {
+		tl.SetTemplate(t)
 	}
-	return execTemplate(t, e.TemplateName(), data)
+	return execTemplate(t, e.TemplateName(), e)
 }
 
 func init() {
@@ -193,10 +207,16 @@ func (t Text) TemplateName() string { return "text" }
 
 // List represents a bulleted list.
 type List struct {
-	Bullet []string
+	Bullet   []*Elems
+	Template *template.Template
 }
 
+// TemplateName implemenets Template interface
 func (l List) TemplateName() string { return "list" }
+
+func (ls *List) SetTemplate(t *template.Template) {
+	ls.Template = t
+}
 
 // Lines is a helper for parsing line-based input.
 type Lines struct {
@@ -366,13 +386,11 @@ func parseSections(ctx *Context, name string, lines *Lines, number []int) ([]Sec
 				pre = strings.TrimRightFunc(pre, unicode.IsSpace)
 				e = Text{Lines: []string{pre}, Pre: true}
 			case strings.HasPrefix(text, "- "):
-				var b []string
-				for ok && strings.HasPrefix(text, "- ") {
-					b = append(b, text[2:])
-					text, ok = lines.next()
-				}
 				lines.back()
-				e = List{Bullet: b}
+				var err error
+				if e, err = parseList(ctx, "-", lines); err != nil {
+					return nil, err
+				}
 			case isSpeakerNote(text):
 				section.Notes = append(section.Notes, text[2:])
 			case strings.HasPrefix(text, prefix+"* "):
@@ -552,6 +570,34 @@ func parseTime(text string) (t time.Time, ok bool) {
 		return t, true
 	}
 	return time.Time{}, false
+}
+
+func parseList(ctx *Context, pref string, lines *Lines) (ls *List, err error) {
+	var prefsublist = pref + "-"
+	var prefover = pref + " "
+	ls = new(List)
+	for text, ok := lines.next(); ok; text, ok = lines.next() {
+		if strings.HasPrefix(text, prefover) {
+			e := Text{[]string{text[len(prefover):]}, false}
+			elems := Elems{[]Elem{e}, nil}
+			ls.Bullet = append(ls.Bullet, &elems)
+		} else if strings.HasPrefix(text, prefsublist) {
+			if len(ls.Bullet) == 0 {
+				return ls, errors.New("Sublist must be a part of a list")
+			}
+			var sublist Elem
+			if sublist, err = parseList(ctx, prefsublist, lines); err != nil {
+				return ls, err
+			}
+			prev := ls.Bullet[len(ls.Bullet)-1]
+			prev.Children = append(prev.Children, sublist)
+		} else {
+			break
+		}
+	}
+	lines.back()
+	return ls, nil
+
 }
 
 func isSpeakerNote(s string) bool {
